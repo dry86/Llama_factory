@@ -1,0 +1,5 @@
+{
+    "prompt": {problem(text)},
+    "response": {ground_truth},
+    "images": {image}
+}

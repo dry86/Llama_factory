@@ -1,0 +1,14 @@
+### Note: DO NOT use quantized model or quantization_bit when merging lora adapters
+
+### model
+model_name_or_path: /newdisk/public/wws/00-Model-AIGC/Qwen2-VL-7B-Instruct
+adapter_name_or_path: saves/qwen2vl-7b/lora-450v3/sft_4e_lr1e-4
+template: qwen2_vl
+trust_remote_code: true
+
+### export
+export_dir: output/qwen2vl_7b/lora_450v3_sft_4e_lr1e-4
+export_size: 5
+export_device: cpu  # choices: [cpu, auto]
+export_legacy_format: false
+

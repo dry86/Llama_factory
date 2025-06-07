@@ -1,0 +1,15 @@
+{
+    "messages": [
+        {
+            "content": "<image>{problem}",
+            "role": "user"
+        },
+        {
+            "role": "assistant",
+            "content": "{think} + {answer}"
+        }
+    ],
+    "images": [
+        "{image_path}"
+    ]
+}
