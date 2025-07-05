@@ -35,7 +35,14 @@ def load_json(fp: Path) -> List[Dict[str, Any]]:
         return obj["data"]
     raise ValueError("Unrecognized JSON format – expected a list or a dict with key 'data'.")
 
+def load_jsonl(fp: Path) -> List[Dict[str, Any]]:
+    """Load evaluation data from a JSONL file.
 
+    The file can either be a list of objects or a dict that contains the list
+    under the key ``data``.
+    """
+    with fp.open("r", encoding="utf-8") as f:
+        return [json.loads(line.strip()) for line in f]
 def build_llm(model_name: str,
               adapter_path: str = None,
               dtype: str = "bfloat16",
@@ -54,7 +61,7 @@ def build_llm(model_name: str,
         "dtype": dtype,
         "tensor_parallel_size": tp_size,
         "max_model_len": max_model_len,
-        "limit_mm_per_prompt": {"image": 1, "video": 0},  # Qwen2‑VL supports 1 img/prompt by default
+        "limit_mm_per_prompt": {"image": 2, "video": 0},  # Qwen2‑VL supports 1 img/prompt by default
         "gpu_memory_utilization": gpu_memory_utilization,
         "enable_lora": adapter_path is not None,  # 启用 LoRA 支持
         "max_lora_rank": max_lora_rank,  # 设置最大 LoRA rank
@@ -63,14 +70,39 @@ def build_llm(model_name: str,
     return LLM(**engine_args)
 
 
-def make_prompt(processor: AutoProcessor, user_prompt: str) -> str:
+def make_prompt(processor: AutoProcessor, text: str) -> str:
     """Wrap raw prompt text with ChatML tags expected by Qwen‑family models."""
+
+
+    # problem = (
+    #     f"As a hateful speech detection expert, you are presented with an image with text removed and the overlaid text: \"{text}\".\n\n"
+    #     f"Hateful speech is defined as a direct or indirect attack on people based on characteristics such as ethnicity, race, nationality, immigration status, religion, caste, sex, gender identity, sexual orientation, disability, or disease. "
+    #     f"Such attacks may include dehumanizing comparisons (e.g., likening people to animals), statements of inferiority, calls for exclusion or segregation, or mocking hate crimes.\n\n"
+    #     f"Instructions:\n"
+    #     f"1. Analyze the context, objects, and emotional tone conveyed by the image.\n"
+    #     f"2. Analyze the stance, sarcasm, and discriminatory elements injected by the text.\n"
+    #     f"3. Consider how the combination of image and text might amplify hateful speech.\n\n"
+    #     f"Provide your reasoning process within <think> </think>.\n"
+    #     f"Give your final decision using either 'hateful' or 'not-hateful', enclosed in <answer> </answer> tags."
+    # )
+    problem = (
+        f"As a hateful speech detection expert, you are presented with two images and the overlaid text: \"{text}\".\n\n"
+        f"1. Analyze the context, objects, and emotional tone conveyed by the clean image (image with text removed).\n"
+        f"2. Analyze the context, objects, and emotional tone of the memes image (image with text included).\n"
+        f"3. Analyze the stance, sarcasm, and discriminatory elements injected by the text.\n"
+        f"4. Consider how the combination of the memes image and the text might amplify hateful speech.\n\n"
+        f"Provide your reasoning process within <think> </think>.\n"
+        f"Give your final decision using either 'hateful' or 'not-hateful', enclosed in <answer> </answer> tags."
+    )
+
+    prompt = problem.format(text=text)
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image"},                       # 只写 type 即可，真正图片走 mm_data
-                {"type": "text", "text": user_prompt},
+                {"type": "image"},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -157,7 +189,8 @@ def calculate_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
 
 def main():
     parser = argparse.ArgumentParser(description="Batch inference with Qwen2‑VL‑2B on vLLM – JSON I/O version")
-    parser.add_argument("--dataset", type=Path, default=Path("/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/data_use/FHM_test_seen_infer_format.json"), help="Path to evaluation JSON file")
+    parser.add_argument("--img_base_dir", type=str, default="/newdisk/public/wws/01-AIGC-Memes/Memes_clean/FHM_test_clean", help="test_seen or test_unseen")
+    parser.add_argument("--dataset", type=Path, default=Path("/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/data_use/test_seen.jsonl"), help="Path to evaluation JSON file")
     parser.add_argument("--save", type=Path, default=Path("predictions.json"), help="Path to output JSON file")
     parser.add_argument("--model", type=str, default="/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/output/qwen2vl_7b/lora_450v2_sft_4e_lr1e-4", help="HF hub id or local dir")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization")
@@ -172,7 +205,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=-1)
-    parser.add_argument("--max_tokens", type=int, default=512)
+    parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"])
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -208,23 +241,30 @@ def main():
     )
 
     # Load dataset (list of dict)
-    samples = load_json(args.dataset)
+    samples = load_jsonl(args.dataset)
 
     # Construct vLLM request objects
     requests = []
     for ex in samples:
-        user_prompt = ex["prompt"]
-        chatml_prompt = make_prompt(processor, user_prompt)
+        text = ex["text"]
+        chatml_prompt = make_prompt(processor, text)
         prompt_ids = tokenizer.encode(chatml_prompt)
 
-        img_path = Path(ex["images"])
-        if not img_path.is_file():
+        base_dir = Path(args.img_base_dir)
+
+        img_path = os.path.join(base_dir, ex["img"])
+        if not os.path.isfile(img_path):
             raise FileNotFoundError(img_path)
         image = Image.open(img_path).convert("RGB")
 
+        img_path2 = os.path.join("/newdisk/public/wws/00-Dataset-AIGC/FHM_new/img", ex["img"])  
+        if not os.path.isfile(img_path2):
+            raise FileNotFoundError(img_path2)
+        image2 = Image.open(img_path2).convert("RGB")
+
         request = {
             "prompt_token_ids": prompt_ids,
-            "multi_modal_data": {"image": [image]},
+            "multi_modal_data": {"image": [image, image2]},
         }
         
         # 如果使用了 LoRA adapter，添加 LoRA 请求
@@ -239,17 +279,18 @@ def main():
         chunk = requests[i : i + args.batch_size]
         results = llm.generate(chunk, sampler)
         outputs.extend(results)
+        # break
 
     # Collect predictions
     predictions = []
     for sample, res in zip(samples, outputs):
         answer = res.outputs[0].text
-        gt = extract_harm_answer(sample.get("response", ""))
+        gt = "hateful" if sample["label"] == 1 else "not-hateful"
         pred = extract_harm_answer(answer)
         
         predictions.append({
-            "image": sample["images"],
-            "prompt": sample["prompt"],
+            "image": sample["img"],
+            "text": sample["text"],
             "think": answer,
             "gt": gt,
             "pred": pred,

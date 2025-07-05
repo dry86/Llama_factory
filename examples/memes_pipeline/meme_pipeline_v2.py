@@ -65,6 +65,7 @@ def load_vllm_model(model_id, dtype, gpus=None, tp_size=1, gpu_memory_utilizatio
         "dtype": dtype,
         "tensor_parallel_size": tp_size,
         "max_model_len": 32768,
+        "limit_mm_per_prompt": {"image": 1, "video": 0},
         "gpu_memory_utilization": gpu_memory_utilization,
         "trust_remote_code": True
     }
@@ -77,7 +78,7 @@ def load_vllm_model(model_id, dtype, gpus=None, tp_size=1, gpu_memory_utilizatio
 def load_image(path: str) -> Image.Image:
     return Image.open(path).convert("RGB")
 
-def _generate(model, messages: List[dict], max_new_tokens=256, temperature=0.7) -> str:
+def _generate(model, messages: List[dict], max_new_tokens=512, temperature=0.7) -> str:
     
     # 应用聊天模板
     prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
@@ -96,6 +97,29 @@ def _generate(model, messages: List[dict], max_new_tokens=256, temperature=0.7) 
         "multi_modal_data": {
             "image": image_data,
         },
+    }
+
+    # 生成响应
+    outputs = model.generate(vllm_inputs, sampling_params)
+    generated = outputs[0].outputs[0].text
+    return generated.strip()
+
+def _generate_text(model, messages: List[dict], max_new_tokens=512, temperature=0.7) -> str:
+    
+    # 应用聊天模板
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+
+    # image_data, _ = process_vision_info(messages)
+    
+    # 设置采样参数
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=0.9
+    )
+    
+    vllm_inputs = {
+        "prompt": prompt,
     }
 
     # 生成响应
@@ -185,53 +209,45 @@ def load_data_from_jsonl(jsonl_path: str, img_base_dir: str = None):
     return data
 
 # ----------------------- 3. Q-Generator -----------------------
-Q_GEN_TEMPLATE = (
-    "You are a content-safety auditor. Based on the image and the overlaid text: \"{text}\", "
-    "generate {k} concise probing questions (one question per line, **do not answer them**). "
-    "The goal is to help a downstream reviewer decide whether the meme is **hateful** or **non-hateful**.\n\n"
-    "When crafting each question, think along these lines:\n"
-    "  1. Does the textual content reinforce stereotypes or contain slurs/derogatory language toward a protected group?\n"
-    "  2. Do the visual elements depict a protected group in an insulting, demeaning, or dehumanizing way?\n"
-    "  3. Could the overall combination of text and imagery incite fear, negative emotions, or harm toward a protected group?\n"
-    "Output exactly {k} numbered questions, one per line, with no additional commentary."
-)
 
-def generate_questions(model, img: Image.Image, text: str = None, k: int = 3) -> List[str]:
-    prompt = Q_GEN_TEMPLATE.format(text=text, k=k)
+
+def generate_text_analysis(model, text: str = None) -> List[str]:
+    Text_Analysis_TEMPLATE = (
+        f"You are a meme text analysis expert. "
+        f"Please provide a comprehensive analysis of the following meme text: \"{text}\" based on the following aspects:\n\n"
+        f"1. Literal meaning: Explain the most direct, surface-level meaning of the text.\n"
+        f"2. Possible metaphors, puns, or cultural references: Identify any implicit meanings, wordplay, or specific cultural associations that may be present in the text.\n"
+        f"3. Emotional tone or attitude: Assess the emotions expressed by the text (such as humor, sarcasm, anger, joy, etc.).\n"
+        f"4. Risk assessment: Does the text potentially contain offensive, discriminatory, or sensitive content? If so, please specify the reasons; if not, state \"No relevant risks identified.\"\n"
+        f"5. Possible image context: Please reasonably speculate what kind of image might accompany this text, and what kind of message or emotional effect the combination of text and image might create.\n"
+        f"Summarize your analysis into a concise and coherent paragraph of no more than 5 sentences."
+    )
+
+    # Text_Analysis_TEMPLATE = (
+    #     '你是一位meme文本分析专家。'
+    #     '请针对以下meme文本：“{text}”，按照如下要求进行综合分析：\n\n'
+    #     '1. 字面含义：解释该文本最直接、表层的意思。\n'
+    #     '2. 可能的隐喻、双关或文化指涉：指出文本中可能包含的隐含意义、特定文化关联。\n'
+    #     '3. 情感色彩或态度：判断该文本表达的情绪（如幽默、讽刺、愤怒、喜悦等）。\n'
+    #     '4. 风险评估：该文本是否可能包含冒犯性、歧视性或敏感含义？如有，请具体说明原因；如无，请写“未发现相关风险”。\n'
+    #     '5. 可能的配图情境：请合理推测该文本可能会配合怎样的图片，以及图文可能形成怎样的信息或情感效果。\n'
+    #     '请将所有分析内容整合为一段连贯、详细的自然语言描述。'
+    # )
     # 如果有文本，添加到提示中
 
     messages = [
         {"role": "user",
          "content": [
-             {"type": "image", "image": img},
-             {"type": "text", "text": prompt}
+             {"type": "text", "text": Text_Analysis_TEMPLATE}
          ]}
     ]
-    raw = _generate(model, messages, max_new_tokens=128)
-    # 兼容"1. XXX\n2. YYY"或换行的简单正则
-    qs = re.findall(r"(?:^\d+[.\s]+)?(.+?)(?:$|\n)", raw, flags=re.M)
-    return [q.strip() for q in qs if q.strip()][:k]
+    raw = _generate_text(model, messages, max_new_tokens=512)
+    print("-"*50)
+    print("text analysis:")
+    print(raw)
+    print("-"*50)
+    return raw
 
-# ----------------------- 4. VQA Answerer -----------------------
-# A_SYS_PROMPT = "你是视觉问答专家，请基于图像内容精确回答用户问题。"
-A_SYS_PROMPT = (
-    "You are a visual-question-answering expert assisting a hate-speech audit. "
-    "Answer the user's question precisely, based only on the image and the overlaid text: \"{text}\"."
-)
-
-def answer_question(model, img: Image.Image, question: str, text: str = None) -> str:
-    # 如果有文本，添加到问题中
-    sys_prompt = A_SYS_PROMPT.format(text=text)
-        
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user",
-         "content": [
-             {"type": "image", "image": img},
-             {"type": "text", "text": question}
-         ]}
-    ]
-    return _generate(model, messages, max_new_tokens=128, temperature=0.3)
 
 # ----------------------- 5. Reasoner -----------------------
 # REASON_TEMPLATE = """你是仇恨言论检测专家。\n以下给出图像、其文字内容及 (问题, 回答) 组。\n\
@@ -239,48 +255,55 @@ def answer_question(model, img: Image.Image, question: str, text: str = None) ->
 # 2) 在 <answer> </answer> 中只给出 hateful 或 non-hateful。"""
 
 
-REASON_TEMPLATE = (
-    "You are a hate-speech detection expert.\n"
-    "You will receive: (1) the image and its overlaid text, and (2) a list of (Question, Answer) pairs generated in the previous steps.\n\n"
-    "  **Hatefulness Definition**\n"
-    "   Hate speech is a direct or indirect attack on people based on protected characteristics such as ethnicity, race, nationality, immigration status, religion, caste, sex, gender identity, sexual orientation, disability, or disease. "
-    "Attacks include violent or dehumanizing language (e.g., comparing people to animals), statements of inferiority, calls for exclusion or segregation, and mocking hate crimes.\n"
-    "   **Exceptions**: Insults aimed at specific individuals (e.g., public figures) are allowed if they do not target protected traits. Criticism of hateful or terrorist groups is also not considered hateful.\n\n"
-    "Proceed in two steps:\n"
-    "  1. Inside <think> </think>, write a concise reasoning paragraph that cites concrete evidence from the (Question, Answer) pairs and the meme itself.\n"
-    "  2. Inside <answer> </answer>, output **only** one word: hateful or non-hateful.\n\n"
-    "Do not output anything outside these two tag blocks."
-)
+def reason(model, img: Image.Image, text_analysis: str, text: str = None) -> str:
 
-
-
-def reason(model, img: Image.Image, qas: List[Tuple[str, str]], text: str = None) -> str:
-    qa_block = "\n".join([f"Q: {q}\nA: {a}" for q, a in qas])
-    
-    # prompt = REASON_TEMPLATE.format(text=text)
-    # 如果有文本，添加到提示中
-    # if text:
-    #     prompt = f"{REASON_TEMPLATE}\n"
+    # problem = (
+    #     f"As a hateful speech detection expert, you are presented with a meme sample containing an image and the overlaid text: \"{text}\".\n\n"
+    #     f"Hateful speech is defined as a direct or indirect attack on people based on characteristics such as ethnicity, race, nationality, immigration status, religion, caste, sex, gender identity, sexual orientation, disability, or disease. "
+    #     f"Such attacks may include dehumanizing comparisons (e.g., likening people to animals), statements of inferiority, calls for exclusion or segregation, or mocking hate crimes.\n\n"
+    #     f"Exceptions: Attacks targeting individuals (e.g., public figures) that are not based on protected characteristics, or criticisms directed at hate groups (e.g., terrorist organizations), are **not** considered hateful.\n\n"
+    #     f"Instructions:\n"
+    #     f"1. Carefully analyze the visual and textual content.\n"
+    #     f"2. Consider both overt and subtle hateful expressions based on the definition above.\n"
+    #     f"3. Provide your reasoning process within <think> </think>.\n"
+    #     f"4. Give your final decision using either 'hateful' or 'not-hateful', enclosed in <answer> </answer> tags."
+    #     f"先分析图像内容，注意图像中的细节元素，然后综合文字的分析内容，最后综合判断是否属于仇恨言论。"
+    # )
+    problem = (
+        f"As a hateful speech detection expert, you are presented with a meme sample containing an image and the overlaid text: \"{text}\".\n\n"
+        f"Hateful speech is defined as a direct or indirect attack on people based on characteristics such as ethnicity, race, nationality, immigration status, religion, caste, sex, gender identity, sexual orientation, disability, or disease. "
+        f"Such attacks may include dehumanizing comparisons (e.g., likening people to animals), statements of inferiority, calls for exclusion or segregation, or mocking hate crimes.\n\n"
+        f"Exceptions: Attacks targeting individuals (e.g., public figures) that are not based on protected characteristics, or criticisms directed at hate groups (e.g., terrorist organizations), are **not** considered hateful.\n\n"
+        f"Instructions:\n"
+        f"1. Carefully analyze the visual content, paying close attention to detailed elements in the image.\n"
+        f"2. Refer to the following text analysis for the overlaid text:\n"
+        f"---\n"
+        f"{text_analysis}\n"
+        f"---\n"
+        f"3. Consider both overt and subtle hateful expressions based on the definition above.\n"
+        f"4. Provide your reasoning process within <think> </think>.\n"
+        f"5. Give your final decision using either 'hateful' or 'not-hateful', enclosed in <answer> </answer> tags.\n"
+        f"Make sure your reasoning integrates both the visual elements and the detailed text analysis before making the final judgment."
+    )
     
     messages = [
-        {"role": "system", "content": REASON_TEMPLATE},
+        # {"role": "system", "content": REASON_TEMPLATE},
         {"role": "user",
          "content": [
              {"type": "image", "image": img},
              {"type": "text",
-              "text": f"The overlaid text: \"{text}\"\nThe following are the probing questions and answers:\n{qa_block}"}
+              "text": problem}
          ]}
     ]
-    return _generate(model, messages, max_new_tokens=256, temperature=0.3)
+    return _generate(model, messages, max_new_tokens=512, temperature=0.3)
 
 # ----------------------- 6. 处理单个样本 -----------------------
-def process_sample(model, item, k: int = 3, verbose: bool = True):
+def process_sample(model, item, verbose: bool = True):
     """处理单个样本
     
     Args:
         model: vLLM模型
         item: 样本数据，包含img_path、text、label等
-        k: 生成问题数量
         verbose: 是否打印详细信息
         
     Returns:
@@ -298,28 +321,16 @@ def process_sample(model, item, k: int = 3, verbose: bool = True):
     
     img = load_image(img_path)
     
-    # Step-1: 生成问题
+    # Step-1: 生成text analysis
     if verbose:
-        print(f"\n=== Step-1 生成 {k} 个 probing 问题 ===")
-    questions = generate_questions(model, img, text, k=k)
-    if verbose:
-        for i, q in enumerate(questions, 1):
-            print(f"{i}. {q}")
+        print(f"\n=== Step-1 生成text analysis ===")
+    text_analysis = generate_text_analysis(model, text)
 
-    # Step-2: VQA 回答
-    if verbose:
-        print("\n=== Step-2 VQA 回答 ===")
-    qas = []
-    for q in questions:
-        a = answer_question(model, img, q, text)
-        qas.append((q, a))
-        if verbose:
-            print(f"Q: {q}\nA: {a}\n")
 
     # Step-3: Reasoner 综合判断
     if verbose:
         print("=== Step-3 Reasoner 综合判断 ===")
-    result = reason(model, img, qas, text)
+    result = reason(model, img, text_analysis, text)
     if verbose:
         print(result)
     
@@ -334,8 +345,7 @@ def process_sample(model, item, k: int = 3, verbose: bool = True):
         "id": item['id'],
         "prediction": prediction,
         "ground_truth": ground_truth,
-        "questions": questions,
-        "qas": qas,
+        "text_analysis": text_analysis,
         "reasoning": result
     }
 
@@ -395,7 +405,7 @@ def run_jsonl_pipeline(model, jsonl_path: str, img_base_dir: str = None, k: int 
     for i, item in enumerate(data):
         try:
             print(f"\n处理第 {i+1}/{len(data)} 个样本...")
-            result = process_sample(model, item, k=k, verbose=verbose)
+            result = process_sample(model, item, verbose=verbose)
             results.append(result)
             
             # 每处理一个样本就追加写入文件
@@ -458,6 +468,11 @@ def run_jsonl_pipeline(model, jsonl_path: str, img_base_dir: str = None, k: int 
     return results
 
 if __name__ == "__main__":
+    '''
+    此版本尝试如下： 见prompt
+    给一个语言大模型 text 让其分析文本的隐喻等信息，输出的分析 + clean_img给VLM 
+    两轮信息判断这个memes是否存在hatefulness
+    '''
     time_start = time.time()
 
     parser = argparse.ArgumentParser()
@@ -466,14 +481,14 @@ if __name__ == "__main__":
     parser.add_argument("-jsonl", type=str, default="/newdisk/public/wws/00-Dataset-AIGC/FHM_new/test_seen.jsonl", help="path to jsonl file")
     parser.add_argument("-img_dir", type=str, default="/newdisk/public/wws/00-Dataset-AIGC/FHM_new", help="base directory for images")
     parser.add_argument("-max_samples", type=int, default=None, help="maximum number of samples to process")
-    parser.add_argument("-output", type=str, default="/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/examples/memes_pipeline/outputs/results.json", help="output JSON file path to save results")
+    parser.add_argument("-output", type=str, default=f"/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/examples/memes_pipeline/outputs/resultsv2_{time_start}.json", help="output JSON file path to save results")
     parser.add_argument("-mode", type=str, choices=["single", "jsonl"], default="jsonl", help="run mode: single image or jsonl file")
     parser.add_argument("-verbose", action="store_true", help="print detailed information")
     
     # GPU 设置
     parser.add_argument("--gpus", type=str, default="2", help="Visible GPU ids, e.g. '0,1'. Empty = all visible")
     parser.add_argument("--tp", type=int, default=1, help="Tensor‑parallel world size (default = #GPUs)")
-    parser.add_argument("--gpu_mem", type=float, default=0.95, help="GPU memory utilization (0.0-1.0)")
+    parser.add_argument("--gpu_mem", type=float, default=0.9, help="GPU memory utilization (0.0-1.0)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"])
     
     args = parser.parse_args()

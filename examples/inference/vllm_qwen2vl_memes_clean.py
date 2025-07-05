@@ -35,7 +35,14 @@ def load_json(fp: Path) -> List[Dict[str, Any]]:
         return obj["data"]
     raise ValueError("Unrecognized JSON format – expected a list or a dict with key 'data'.")
 
+def load_jsonl(fp: Path) -> List[Dict[str, Any]]:
+    """Load evaluation data from a JSONL file.
 
+    The file can either be a list of objects or a dict that contains the list
+    under the key ``data``.
+    """
+    with fp.open("r", encoding="utf-8") as f:
+        return [json.loads(line.strip()) for line in f]
 def build_llm(model_name: str,
               adapter_path: str = None,
               dtype: str = "bfloat16",
@@ -63,14 +70,43 @@ def build_llm(model_name: str,
     return LLM(**engine_args)
 
 
-def make_prompt(processor: AutoProcessor, user_prompt: str) -> str:
+def make_prompt(processor: AutoProcessor, text: str) -> str:
     """Wrap raw prompt text with ChatML tags expected by Qwen‑family models."""
+
+
+    # problem = (
+    #     f"As a hateful speech detection expert, you are presented with a meme sample containing an image and the overlaid text: \"{text}\".\n\n"
+    #     f"Hateful speech is defined as a direct or indirect attack on people based on characteristics such as ethnicity, race, nationality, immigration status, religion, caste, sex, gender identity, sexual orientation, disability, or disease. "
+    #     f"Such attacks may include dehumanizing comparisons (e.g., likening people to animals), statements of inferiority, calls for exclusion or segregation, or mocking hate crimes.\n\n"
+    #     f"Exceptions: Attacks targeting individuals (e.g., public figures) that are not based on protected characteristics, or criticisms directed at hate groups (e.g., terrorist organizations), are **not** considered hateful.\n\n"
+    #     f"Instructions:\n"
+    #     f"1. Carefully analyze the visual and textual content.\n"
+    #     f"2. Consider both overt and subtle hateful expressions based on the definition above.\n"
+    #     f"3. Provide your reasoning process within <think> </think>.\n"
+    #     f"4. Give your final decision using either 'hateful' or 'not-hateful', enclosed in <answer> </answer> tags."
+    # )
+
+        #     f"Hateful speech is defined as a direct or indirect attack on people based on characteristics such as ethnicity, race, nationality, immigration status, religion, caste, sex, gender identity, sexual orientation, disability, or disease. "
+        # f"Such attacks may include dehumanizing comparisons (e.g., likening people to animals), statements of inferiority, calls for exclusion or segregation, or mocking hate crimes.\n\n"
+        # f"Instructions:\n"
+
+    problem = (
+        f"As a hateful speech detection expert, you are presented with an image with text removed and the overlaid text: \"{text}\".\n\n"
+        f"1. Analyze the context, objects, and emotional tone conveyed by the image.\n"
+        f"2. Analyze the stance, sarcasm, and discriminatory elements injected by the text.\n"
+        f"3. Consider how the combination of image and text might amplify hateful speech.\n\n"
+        f"Provide your reasoning process within <think> </think>.\n"
+        f"Give your final decision using either 'hateful' or 'not-hateful', enclosed in <answer> </answer> tags."
+    )
+
+
+    prompt = problem.format(text=text)
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image"},                       # 只写 type 即可，真正图片走 mm_data
-                {"type": "text", "text": user_prompt},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -157,7 +193,8 @@ def calculate_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
 
 def main():
     parser = argparse.ArgumentParser(description="Batch inference with Qwen2‑VL‑2B on vLLM – JSON I/O version")
-    parser.add_argument("--dataset", type=Path, default=Path("/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/data_use/FHM_test_seen_infer_format.json"), help="Path to evaluation JSON file")
+    parser.add_argument("--img_base_dir", type=str, default="/newdisk/public/wws/01-AIGC-Memes/Memes_clean/FHM_test_clean", help="test_seen or test_unseen")
+    parser.add_argument("--dataset", type=Path, default=Path("/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/data_use/test_seen.jsonl"), help="Path to evaluation JSON file")
     parser.add_argument("--save", type=Path, default=Path("predictions.json"), help="Path to output JSON file")
     parser.add_argument("--model", type=str, default="/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/output/qwen2vl_7b/lora_450v2_sft_4e_lr1e-4", help="HF hub id or local dir")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization")
@@ -165,7 +202,7 @@ def main():
     parser.add_argument("--max_lora_rank", type=int, default=8, help="Maximum LoRA rank (should match the rank used in SFT)")
 
     # GPU & performance
-    parser.add_argument("--gpus", type=str, default="0", help="Visible GPU ids, e.g. '0,1'. Empty = all visible")
+    parser.add_argument("--gpus", type=str, default="2", help="Visible GPU ids, e.g. '0,1'. Empty = all visible")
     parser.add_argument("--tp", type=int, default=1, help="Tensor‑parallel world size (default = #GPUs)")
 
     parser.add_argument("--batch_size", type=int, default=8)
@@ -208,17 +245,19 @@ def main():
     )
 
     # Load dataset (list of dict)
-    samples = load_json(args.dataset)
+    samples = load_jsonl(args.dataset)
 
     # Construct vLLM request objects
     requests = []
     for ex in samples:
-        user_prompt = ex["prompt"]
-        chatml_prompt = make_prompt(processor, user_prompt)
+        text = ex["text"]
+        chatml_prompt = make_prompt(processor, text)
         prompt_ids = tokenizer.encode(chatml_prompt)
 
-        img_path = Path(ex["images"])
-        if not img_path.is_file():
+        base_dir = Path(args.img_base_dir)
+
+        img_path = os.path.join(base_dir, ex["img"])
+        if not os.path.isfile(img_path):
             raise FileNotFoundError(img_path)
         image = Image.open(img_path).convert("RGB")
 
@@ -239,17 +278,18 @@ def main():
         chunk = requests[i : i + args.batch_size]
         results = llm.generate(chunk, sampler)
         outputs.extend(results)
+        # break
 
     # Collect predictions
     predictions = []
     for sample, res in zip(samples, outputs):
         answer = res.outputs[0].text
-        gt = extract_harm_answer(sample.get("response", ""))
+        gt = "hateful" if sample["label"] == 1 else "not-hateful"
         pred = extract_harm_answer(answer)
         
         predictions.append({
-            "image": sample["images"],
-            "prompt": sample["prompt"],
+            "image": sample["img"],
+            "text": sample["text"],
             "think": answer,
             "gt": gt,
             "pred": pred,
