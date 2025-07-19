@@ -107,9 +107,8 @@ def make_decision_prompt(processor: AutoProcessor, analysis: str) -> str:
         "You are a hateful-speech classification assistant.\n"
         "Below is the reasoning produced in the previous step:\n"
         f"{analysis}\n"
-        "Based on this reasoning and the definition of hateful speech provided earlier, "
-        "answer with either 'hateful' or 'not-hateful'.\n"
-        "Output format:\n<answer> hateful | not-hateful </answer>\n"
+        "Based on this reasoning, is it hateful? "
+        "Output format: yes | no \n"
         "Do not repeat the reasoning or add any extra text."
     )
     # 用统一 chat_template，此处只有纯文本
@@ -125,57 +124,41 @@ def make_decision_prompt(processor: AutoProcessor, analysis: str) -> str:
 
 def extract_harm_answer(text: str) -> str | None:
     """
-    从文本中提取 hateful/not-hateful 答案
+    从文本中提取 Yes/No 答案
     
     Args:
         text: 包含答案的文本
         
     Returns:
-        提取出的答案 (hateful/not-hateful) 或 None
+        提取出的答案 (Yes/No) 或 None
     """
-    if text is None:
-        return None
-    
-    # 规范化文本，处理可能的大小写和空格问题
     text = text.lower().strip()
+    if text == "yes":
+        return "yes"
+    elif text == "no":
+        return "no"
     
-    # 如果直接是"hateful"或"non-hateful"，直接返回结果
-    if text == "hateful":
-        return "hateful"
-    elif text == "non-hateful":
-        return "not-hateful"
-    
-    # 1. 首先尝试从 <answer> 标签中提取
-    answer_match = re.search(r'<answer>(.*?)</answer>', text, re.IGNORECASE)
-    if answer_match:
-        answer = answer_match.group(1).strip().lower()
-        if answer in ['hateful', 'not-hateful']:
-            return answer
-    
-    # 2. 尝试从非标准格式中提取
+    # 尝试从非标准格式中提取
     patterns = [
-        r'答案是\s*(hateful|not-hateful)\b',
-        r'answer is\s*(hateful|not-hateful)\b',
-        r'answer:\s*(hateful|not-hateful)\b',
-        r'the answer is\s*(hateful|not-hateful)\b',
-        r'final answer:\s*(hateful|not-hateful)\b',
-        r'conclusion:\s*(hateful|not-hateful)\b',
-        r'result:\s*(hateful|not-hateful)\b',
-        r'output:\s*(hateful|not-hateful)\b',
-        r'judgment:\s*(hateful|not-hateful)\b',
-        r'verdict:\s*(hateful|not-hateful)\b',
-        r'\s*(hateful|not-hateful)\b'
+        r'答案是\s*(Yes|No)\b',
+        r'answer is\s*(Yes|No)\b',
+        r'answer:\s*(Yes|No)\b',
+        r'the answer is\s*(Yes|No)\b',
+        r'final answer:\s*(Yes|No)\b',
+        r'conclusion:\s*(Yes|No)\b',
+        r'result:\s*(Yes|No)\b',
+        r'output:\s*(Yes|No)\b',
+        r'\n(Yes|No)$',
+        r'(Yes|No)$'
     ]
     
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            answer = match.group(1).strip().lower()
-            if answer in ['hateful', 'not-hateful']:
-                return answer
+            answer = match.group(1).strip()
+            return answer
     
     return None
-
 
 def calculate_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
     """计算评估指标"""
@@ -187,15 +170,16 @@ def calculate_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
             gt = pred["gt"].lower()
             pred_answer = pred["pred"].lower()
             
-            if gt in ["hateful", "not-hateful"] and pred_answer in ["hateful", "not-hateful"]:
-                    y_true.append(1 if gt == "hateful" else 0)
-                    y_pred.append(1 if pred_answer == "hateful" else 0)
+            if gt in ["yes", "no"] and pred_answer in ["yes", "no"]:
+                    y_true.append(1 if gt == "yes" else 0)
+                    y_pred.append(1 if pred_answer == "yes" else 0)
         except Exception as e:
             print(f"处理错误: {e}")
             continue
     
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
+    y_prob = np.array([p["p_yes"] for p in predictions])
     
     metrics = {
         'accuracy': accuracy_score(y_true, y_pred),
@@ -203,7 +187,7 @@ def calculate_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
         'recall': recall_score(y_true, y_pred),
         'f1': f1_score(y_true, y_pred),
         'f1_macro': f1_score(y_true, y_pred, average='macro'),
-        'auroc': roc_auc_score(y_true, y_pred)
+        'auroc': roc_auc_score(y_true, y_prob)
     }
     
     return metrics
@@ -217,7 +201,7 @@ def main():
     parser = argparse.ArgumentParser(description="Batch inference with Qwen2‑VL‑2B on vLLM – JSON I/O version")
     parser.add_argument("--dataset", type=Path, default=Path("/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/data_use/test_seen.jsonl"), help="Path to evaluation JSON file")
     parser.add_argument("--img_dir", type=str, default="/newdisk/public/wws/00-Dataset-AIGC/FHM_new/img", help="base directory for images")
-    parser.add_argument("--save", type=Path, default=Path("predictions.json"), help="Path to output JSON file")
+    parser.add_argument("--save", type=Path, default=Path("predictions_auc_v2.json"), help="Path to output JSON file")
     parser.add_argument("--model", type=str, default="/newdisk/public/wws/01-AIGC-GPRO/LLaMA-Factory/output/qwen2vl_7b/lora_450v2_sft_4e_lr1e-4", help="HF hub id or local dir")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization")
     parser.add_argument("--adapter", type=str, default=None, help="Path to LoRA adapter")
@@ -228,8 +212,8 @@ def main():
     parser.add_argument("--tp", type=int, default=1, help="Tensor‑parallel world size (default = #GPUs)")
 
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=-1)
     parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"])
@@ -305,7 +289,7 @@ def main():
         chunk = analysis_requests[i : i + args.batch_size]
         results = llm.generate(chunk, sampler)
         analysis_outputs.extend(results)
-        break
+        # break
 
     # -------- NEW: decision pass ----------
     decision_requests = []
@@ -319,32 +303,56 @@ def main():
             "multi_modal_data": {},              # ★ 无图片
         })
 
+    yes_ids = tokenizer.encode("yes", add_special_tokens=False)
+    no_ids  = tokenizer.encode("no",  add_special_tokens=False)
+    assert len(yes_ids) == len(no_ids) == 1, "分词不是单 token 时需改写掩码逻辑"
+    YES_ID, NO_ID = yes_ids[0], no_ids[0]
+
+    # yes_no_mask = LogitsProcessorSpec(
+    #     name="vocab_mask",                # 内置处理器
+    #     # keep == True → 只保留列表里的 token
+    #     # keep == False → 屏蔽列表里的 token
+    #     kwargs={"vocab": [YES_ID, NO_ID], "keep": True},
+    # )
+
     # 可用更小 max_tokens 和低 temperature
     decision_sampler = SamplingParams(
         temperature=0.0,
-        top_p=1.0,
-        max_tokens=64,
+        max_tokens=1,                     # 只要第一个 token
+        logprobs=2,                       # 要求返回 top-2 词的对数概率
         stop_token_ids=[tokenizer.eos_token_id],
+        allowed_token_ids=[YES_ID, NO_ID],   # ★ 关键行：词表硬裁成 {yes,no}
     )
 
     decision_outputs = []
     for i in range(0, len(decision_requests), args.batch_size):
         chunk = decision_requests[i : i + args.batch_size]
-        decision_outputs.extend(llm.generate(chunk, decision_sampler))
+        results = llm.generate(chunk, decision_sampler)
+
+
+        decision_outputs.extend(results)
 
     # ---------------- collect ----------------
     predictions = []
     for sample, ana_res, dec_res in zip(samples, analysis_outputs, decision_outputs):
         think = ana_res.outputs[0].text
-        answer_text = dec_res.outputs[0].text
-        pred = extract_harm_answer(answer_text)
-        gt = "hateful" if sample["label"] == 1 else "not-hateful"
+
+        chosen_id = dec_res.outputs[0].token_ids[0]
+        lp_dict = dec_res.outputs[0].logprobs[0]                  # {id: logp, ...}
+        lp_yes = lp_dict.get(YES_ID, float("-inf")).logprob
+        lp_no  = lp_dict.get(NO_ID,  float("-inf")).logprob
+        # p_yes  = np.exp(lp_yes) / (np.exp(lp_yes) + np.exp(lp_no))
+        p_yes = np.exp(lp_yes - np.logaddexp(lp_yes, lp_no))
+
+        pred = "yes" if chosen_id == YES_ID else "no"
+        gt = "yes" if sample["label"] == 1 else "no"
 
         predictions.append({
             "image": sample["img"],
             "text":  sample["text"],
             "think": think,
-            "answer_raw": answer_text,
+            "answer_raw": dec_res.outputs[0].text,
+            "p_yes": p_yes,
             "gt": gt,
             "pred": pred,
             "is_correct": gt == pred,
